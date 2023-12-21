@@ -4,7 +4,7 @@ import pandas as pd
 def main():
     st.set_page_config(layout="wide")
     st.title("Excel Sheet Comparator")
-
+    st.subheader("This app compares two Excel sheets and shows rows that are present in one sheet but not in the other.")
     # Upload two Excel files
     st.sidebar.header("Upload Excel Files")
     file1 = st.sidebar.file_uploader("Upload first Excel file", type=["xlsx"])

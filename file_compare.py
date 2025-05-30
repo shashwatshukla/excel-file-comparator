@@ -1,67 +1,115 @@
 import streamlit as st
 import pandas as pd
+from fuzzywuzzy import fuzz, process
+from io import BytesIO
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 
-def main():
-    st.set_page_config(layout="wide")
-    st.title("Excel Sheet Comparator")
-    st.subheader("This app compares two Excel sheets and shows rows that are present in one sheet but not in the other.")
-    # Upload two Excel files
-    st.sidebar.header("Upload Excel Files")
-    file1 = st.sidebar.file_uploader("Upload first Excel file", type=["xlsx"])
-    file2 = st.sidebar.file_uploader("Upload second Excel file", type=["xlsx"])
+st.set_page_config(layout="wide")
+st.title("Multi-Excel Comparator with Fuzzy Matching")
 
-    # Check if files are uploaded
-    if file1 is not None and file2 is not None:
-        excel_file1 = pd.ExcelFile(file1)
-        excel_file2 = pd.ExcelFile(file2)
+uploaded_files = st.sidebar.file_uploader("Upload 2 or more Excel files", type=["xlsx"], accept_multiple_files=True)
 
-        # Select sheets for comparison
-        sheet_names1 = excel_file1.sheet_names
-        sheet_names2 = excel_file2.sheet_names
-        sheet1 = st.sidebar.selectbox("Select Sheet in file1 to check", sheet_names1)
-        sheet2 = st.sidebar.selectbox("Select Sheet in file2 to check", sheet_names2)
+if uploaded_files and len(uploaded_files) >= 2:
+    file_names = [f.name for f in uploaded_files]
+    threshold = st.slider("Fuzzy Match Threshold", 70, 100, 90)
 
-        # Display selected sheets
-        st.sidebar.write(f"Sheet in file1 to check: {sheet1}")
-        st.sidebar.write(f"Sheet in file2 to check: {sheet2}")
+    temp_df = pd.read_excel(uploaded_files[0])
+    compare_cols = st.multiselect("Columns to Compare", temp_df.columns.tolist(), default=[temp_df.columns[0]])
 
-        # Read selected sheets into dataframes
-        df1 = pd.read_excel(excel_file1, sheet1)
-        df2 = pd.read_excel(excel_file2, sheet2)
+    def consolidated_presence_matrix(files, filenames, columns, threshold):
+        file_data = [pd.read_excel(f) for f in files]
+        all_values = set()
+        value_counts = {}
 
-        # Get selected columns for comparison
-        selected_columns_df1 = st.multiselect(f"Select columns for comparison in {sheet1}", df1.columns, key="df1")
-        selected_columns_df2 = st.multiselect(f"Select columns for comparison in {sheet2}", df2.columns, key="df2")
-        if selected_columns_df2 and selected_columns_df2:
-        # Find rows present in sheet1 but not in sheet2
-            rows_only_in_sheet1 = find_rows_only_in_sheet(df1[selected_columns_df1], df2[selected_columns_df2])
+        for idx, df in enumerate(file_data):
+            df = df.dropna(subset=columns)
+            df['__combined__'] = df[columns].astype(str).agg(' - '.join, axis=1)
+            value_counts[filenames[idx]] = df['__combined__'].value_counts()
+            all_values.update(df['__combined__'].unique())
 
-            # Find rows present in sheet2 but not in sheet1
-            rows_only_in_sheet2 = find_rows_only_in_sheet(df2[selected_columns_df2], df1[selected_columns_df1])
+        all_values = sorted(list(all_values))
+        summary_data = {'Unique Value': all_values}
 
-            # Display the results
-            st.header(f"Rows present in {sheet1} but not in {sheet2}:")
-            st.dataframe(rows_only_in_sheet1)
+        for filename in filenames:
+            summary_data[filename] = [value_counts.get(filename, {}).get(v, 0) for v in all_values]
 
-            st.header(f"Rows present in {sheet2} but not in {sheet1}:")
-            st.dataframe(rows_only_in_sheet2)
+        summary_df = pd.DataFrame(summary_data)
+        st.subheader("Summary: Count of Each Unique Value Across Files")
 
-            # Export non-matching rows to Excel
-            if st.button("Export Non-Matching Rows"):
-                export_non_matching_rows(rows_only_in_sheet1, f"{sheet1}_not_in_{sheet2}")
-                export_non_matching_rows(rows_only_in_sheet2, f"{sheet2}_not_in_{sheet1}")
+        gb = GridOptionsBuilder.from_dataframe(summary_df)
+        gb.configure_default_column(filter=True, sortable=True, resizable=True, editable=True, groupable=True)
+        gb.configure_grid_options(domLayout='autoHeight', suppressHorizontalScroll=True, suppressColumnVirtualisation=True)
+        gb.configure_auto_height(autoHeight=True)
+        for col in summary_df.columns:
+            gb.configure_column(col, autoSizeColumns=True, suppressSizeToFit=True)
+        grid_options = gb.build()
 
-def find_rows_only_in_sheet(sheet1, sheet2):
-    # Find rows present in sheet1 but not in sheet2
-    merged_df = pd.merge(sheet1, sheet2, how='left', indicator=True)
-    rows_only_in_sheet = merged_df[merged_df['_merge'] == 'left_only'].drop('_merge', axis=1)
-    return rows_only_in_sheet
+        summary_response = AgGrid(
+            summary_df,
+            gridOptions=grid_options,
+            enable_enterprise_modules=True,
+            update_mode=GridUpdateMode.MODEL_CHANGED,
+            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+            allow_unsafe_jscode=True,
+            editable=True,
+            return_mode='AS_INPUT'
+        )
 
-def export_non_matching_rows(non_matching_rows, output_filename):
-    # Save non-matching rows to Excel
-    output_filename += ".xlsx"
-    non_matching_rows.to_excel(output_filename, index=False)
-    st.success(f"Non-matching rows exported to {output_filename}")
+        filtered_summary = summary_response['data']
+        buffer_summary = BytesIO()
+        pd.DataFrame(filtered_summary).to_excel(buffer_summary, index=False)
+        buffer_summary.seek(0)
+        st.download_button(
+            label="Download Filtered Summary",
+            data=buffer_summary,
+            file_name="filtered_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-if __name__ == "__main__":
-    main()
+        # Comparison matrix
+        key_sets = [set(vc.index) for vc in value_counts.values()]
+        matrix = []
+
+        for key in all_values:
+            presence_row = {"Value": key}
+            for idx, key_set in enumerate(key_sets):
+                match, score = process.extractOne(key, list(key_set), scorer=fuzz.token_sort_ratio)
+                presence_row[filenames[idx]] = "Yes" if score >= threshold else "No"
+            matrix.append(presence_row)
+
+        return pd.DataFrame(matrix)
+
+    if compare_cols:
+        st.subheader("Consolidated Presence Matrix")
+        matrix_df = consolidated_presence_matrix(uploaded_files, file_names, compare_cols, threshold)
+        gb = GridOptionsBuilder.from_dataframe(matrix_df)
+        gb.configure_default_column(filter=True, sortable=True, resizable=True, editable=True, groupable=True)
+        gb.configure_grid_options(domLayout='autoHeight', suppressHorizontalScroll=True, suppressColumnVirtualisation=True)
+        gb.configure_auto_height(autoHeight=True)
+        for col in matrix_df.columns:
+            gb.configure_column(col, autoSizeColumns=True, suppressSizeToFit=True)
+        grid_options = gb.build()
+
+        matrix_response = AgGrid(
+            matrix_df,
+            gridOptions=grid_options,
+            enable_enterprise_modules=True,
+            update_mode=GridUpdateMode.MODEL_CHANGED,
+            data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+            allow_unsafe_jscode=True,
+            editable=True,
+            return_mode='AS_INPUT'
+        )
+
+        filtered_matrix = matrix_response['data']
+        buffer_matrix = BytesIO()
+        pd.DataFrame(filtered_matrix).to_excel(buffer_matrix, index=False)
+        buffer_matrix.seek(0)
+        st.download_button(
+            label="Download Filtered Presence Matrix",
+            data=buffer_matrix,
+            file_name="filtered_presence_matrix.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+else:
+    st.info("Please upload at least two Excel files to begin.")
